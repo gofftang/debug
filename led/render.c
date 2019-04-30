@@ -35,7 +35,7 @@ void lr_sram(led_render* lr, int x, int y, int color)
     if (outside(lr, x, y)) {
         fprintf(stderr, "error: [LR] (%d,%d) outside\n", x, y);
         return;
-    } 
+    }
 
     index = get_index(lr, x, y);
 
@@ -47,13 +47,17 @@ void lr_sram(led_render* lr, int x, int y, int color)
 
     if (color)
         lr->data[index] |= (1 << bit);
-    else
+    else {
         lr->data[index] &= ~(1 << bit);
+    }
+
+    // if (x == 1)
+    //     printf("index=%d y=%02d %d %02X\n", index, y, color, lr->data[index]);
 }
 
 void lr_flush(led_render* lr)
 {
-    char data[DEFAULT_DATA_SIZE];
+    char data[DEFAULT_DATA_SIZE] = {0};
     char* p = data;
     int i;
 
@@ -62,12 +66,12 @@ void lr_flush(led_render* lr)
     p += 5;
 #endif
 
-    memcpy(p, "00", 2);
-    p += 2;
+    memcpy(p, "00 ", 3);
+    p += 3;
 
     for (i = 0; i < lr->sz_data; i++) {
-        sprintf(p, "%02x", lr->data[i]);
-        p += 2;
+        sprintf(p, "%02x ", lr->data[i]);
+        p += 3;
     }
 #ifdef USE_SYSTEM
     sprintf(p, " > /sys/class/leds/%s/device/led_pattern", lr->node);
@@ -88,7 +92,7 @@ void lr_fill(led_render* lr, int x, int y, int color)
     if (outside(lr, x, y)) {
         printf("error: [LR] fill (%d,%d) is outside\n", x, y);
         return;
-    } 
+    }
 
     lr_sram(lr, x, y, color);
     index = get_index(lr, x, y);
@@ -109,7 +113,7 @@ void lr_fill(led_render* lr, int x, int y, int color)
 void lr_invert(led_render* lr, bool invert)
 {
     int i;
-    
+
     if (invert != lr->invert) {
         for (i = 0; i < lr->sz_data; i++) {
             lr->data[i] = ~lr->data[i];
@@ -123,9 +127,9 @@ void lr_invert(led_render* lr, bool invert)
 // void lr_flip(led_render* lr, int x0, int y0)
 // {
 //     int x, y;
-    
+
 //     for (i = x0; i < lr->width; i++) {
-        
+
 //     }
 
 //     for (i = x0; i < lr->width; i++) {

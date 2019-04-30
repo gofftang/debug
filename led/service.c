@@ -5,7 +5,10 @@
 #include <unistd.h>
 #include <pthread.h>
 #include <sys/time.h>
+#include <math.h>
+#include "utils.h"
 #include "render.h"
+#include "kiss_fft.h"
 
 #define DEBUG
 
@@ -31,6 +34,7 @@ typedef struct led_device {
 
     bool waving;
     int degree;
+    int wave[FIXED_WIDTH];
 
     bool exit;
     pthread_t pid;
@@ -60,14 +64,48 @@ typedef struct led_session {
     void* extra;
 } led_session;
 
+// 样本数量
+#define SAMPLE_SZIE 512
+// 预分频
+#define PRESCALE    1
+#define FFT_SIZE    SAMPLE_SZIE / PRESCALE
+// 坐标显示个数
+#define AXIS_SIZE   16
+
+
+// #define WAVE_LENGTH 512
+// // WAVE_LENGTH / 2          变换的共轭关系
+// // (WAVE_LENGTH / 2) / 8    8分频提取分量
+// #define FFT_SIZE    ((WAVE_LENGTH / 2) / 8)
+// // 显示频率个数
+// #define AXIS_COUNT  16
+
+typedef struct wave_spectrum {
+    kiss_fft_cpx cin[FFT_SIZE];
+    kiss_fft_cpx cout[FFT_SIZE];
+    kiss_fft_cfg state;
+    int nfft;
+
+    float amps[FFT_SIZE];
+    float mags[FFT_SIZE];
+    int nr_axises;
+    int okey;
+} wave_spectrum_t;
+
 static led_service my_service, *service = &my_service;
+static wave_spectrum_t wave_spectrum = {
+    .nfft = FFT_SIZE,
+    .nr_axises = AXIS_SIZE,
+    .okey = 0,
+};
 
 static led_session* session_create(const char *cmd, void* context);
 static void session_destroy(led_session* se);
 static void session_exec(led_session* se);
 static led_device* get_device(const char *name);
 static void show_time(led_render* render);
-static void show_wave(led_render* render, int degree);
+static void show_random_wave(led_render* render);
+static void show_spectrum_wave(led_render* render);
 static void show_love(led_render* render);
 
 static void flush_hour(led_render* render, int hour);
@@ -224,8 +262,8 @@ static int dot_maps[][DOT_HEIGHT][DOT_WIDTH] =
 };
 #endif
 
-static void* thread_fn(void *arg)  
-{  
+static void* thread_fn(void *arg)
+{
     led_device *dev = (led_device*)arg;
     struct timeval tv_last, tv_now;
     int usec;
@@ -238,7 +276,7 @@ static void* thread_fn(void *arg)
 #endif
         pthread_mutex_lock(&dev->lock);
 
-        if (dev->timing && (tick % 2) == 0) {
+        if (0 && dev->timing && (tick % 2) == 0) {
             time_t new;
             struct tm* tm_new;
             struct tm* tm_now;
@@ -277,8 +315,8 @@ static void* thread_fn(void *arg)
                 memcpy(&dev->now, tm_new, sizeof(struct tm));
         }
 
-        if (dev->waving)
-            show_wave(dev->render, dev->degree);
+        show_spectrum_wave(dev->render);
+        // show_random_wave(dev->render);
 
         pthread_mutex_unlock(&dev->lock);
 
@@ -286,9 +324,8 @@ static void* thread_fn(void *arg)
 #ifdef DEBUG
         // printf("now: %ld\n", tv_now.tv_sec*1000 + tv_now.tv_usec/1000);
 #endif
-        usec = 500000 - tv_now.tv_usec;
-        usec = usec < 50000 ? 50000 : usec;
-        usleep(usec);
+        usec = MAX(50000, 250000 - tv_now.tv_usec);
+        usleep(500000);
         tick++;
     }
 
@@ -350,6 +387,7 @@ int uni_hal_led_register(const char *name)
                 time(&now);
                 memcpy(&dev->now, localtime(&now), sizeof(struct tm));
             }
+            srand(time(NULL));
 
             printf("[LS] register %s handle=(%d,%x)\n",
                     name, (int)dev->pid, (unsigned int)dev->render);
@@ -400,6 +438,9 @@ int uni_hal_led_ctrl(const char *name, const char *cmd)
         return -2;
     }
 
+    if (strcmp(name, "hbs1632.2"))
+        return 0;
+
 #ifdef DEBUG
     printf("[LS ctrl] %s %s\n", name, cmd);
 #endif
@@ -411,6 +452,108 @@ int uni_hal_led_ctrl(const char *name, const char *cmd)
     }
     session_exec(se);
     session_destroy(se);
+
+    return 0;
+}
+
+float hypot_fabs(kiss_fft_cpx *y)
+{
+    return hypot((float)abs(y->r), (float)abs(y->i));
+}
+
+float np_clip(float x, float min, float max)
+{
+    if (x < min)
+        return min;
+    else if (x > max)
+        return max;
+    else
+        return x;
+}
+
+void spectrum(char *buf, int len)
+{
+    wave_spectrum_t *ws = &wave_spectrum;
+    float factor;
+    int i;
+    // static int dump = 0;
+
+    // if (dump == 10) {
+    //     printf("=== buf\n");
+    //     for (i = 0; i < len; i++) {
+    //         printf("%d, ", buf[i]);
+    //     }
+    //     printf("===\n");
+    // }
+    // dump++;
+
+    if (!ws->okey) {
+        ws->state = kiss_fft_alloc(ws->nfft, 0, NULL, NULL);
+        if (ws->state) {
+            kiss_fft_scalar zero;
+
+            // ugly way of setting short,int,float,double, or __m128 to zero
+            memset(&zero,0,sizeof(zero));
+            for (i = 0; i < ws->nfft; i++)
+                ws->cin[i].i = zero;
+
+            ws->okey = 1;
+        }
+    }
+
+    if (ws->okey) {
+        if (PRESCALE > 1) {
+            for (i = 0; i < ws->nfft; i++) {
+                ws->cin[i].r = (buf[i * 8] + buf[i * 8 + 1] + buf[i * 8 + 2]
+                                + buf[i * 8 + 3] + buf[i * 8 + 4] + buf[i * 8 + 5]
+                                + buf[i * 8 + 6] + buf[i * 8 + 7]) / 8.0;
+            }
+        }
+        else {
+            for (i = 0; i < ws->nfft; i++) {
+                ws->cin[i].r = buf[i];
+            }
+        }
+
+        kiss_fft(ws->state, ws->cin, ws->cout);
+
+        // amp[0] = np.abs(mag[0])/fftSize
+        // amp[endIndex] = np.abs(mag[endIndex])/fftSize
+        // amp[1:endIndex] = np.abs(mag[1:endIndex])*temp
+        // amp = 20*np.log10(np.clip(np.abs(amp), 1e-20, 1e100))
+
+        ws->amps[0] = hypot_fabs(&ws->cout[0]) / ws->nfft;
+        ws->amps[ws->nfft - 1] = hypot_fabs(&ws->cout[ws->nfft - 1]) / ws->nfft;
+        factor = 2.0 / ws->nfft;
+        for (i = 1; i < ws->nfft - 1; i++) {
+            ws->amps[i] = hypot_fabs(&ws->cout[i]) * factor;
+            // ws->mags[i] = 20*log10(np_clip(fabs(ws->amps[i]), 1e-20, 1e100));
+        }
+
+
+        // 计算得到幅度基数
+        // 如果要分16份，就基数amps[i] * 16
+        factor = (float)ws->nr_axises * PRESCALE * 2 / len;
+        for (i = 0; i < ws->nfft; i++) {
+            ws->amps[i] *= factor;
+        }
+
+        //20000表示的最大频点20KHZ,这里的20-20K之间坐标的数据成对数关系,这是音频标准
+        //方法中20为低频起点20HZ，16为段数
+        // printf("freqs: ");
+        // factor = pow(20000 / 20, 1.0 / ws->nfft);
+        for (i = 0; i < ws->nfft; i++) {
+            //乘方，30为低频起点，sampleratePoint数组中存的就是坐标值
+            // ws->freqs[i] = 20 * pow(factor, i);
+            // printf("(%f mV, %f dB)\n", ws->amps[i], ws->mags[i]);
+        }
+        // printf("\n");
+    }
+}
+
+int uni_hal_led_feed_buffer(char *buf, int len)
+{
+    spectrum(buf, len);
 
     return 0;
 }
@@ -501,7 +644,7 @@ static led_session* session_create(const char *cmd, void* context)
     }
     else if (strncmp(cmd, "Blink", 5) == 0) {
         if (strlen(cmd) > 6)
-            se->extra = strdup(cmd+6);    
+            se->extra = strdup(cmd+6);
         else
             se->extra = NULL;
         se->type = ACT_LED_BLINK;
@@ -589,7 +732,7 @@ static void session_exec(led_session* se)
         if (se->type & ACT_LED_DISPLAY_WAVE) {
             dev->timing = false;
             dev->waving = true;
-            show_wave(dev->render, (int)se->extra);
+            show_random_wave(dev->render);
 #ifdef DEBUG
             printf("[LS] exec Show waving\n");
 #endif
@@ -633,6 +776,8 @@ static bool isdigt(int digit)
 static void show_digit(led_render* render, int x0, int y0, int digit)
 {
     int x, y;
+
+    return;
 
     if (!isdigt(digit)) {
         printf("error: [LS] invalid digit: %d\n", digit);
@@ -696,6 +841,8 @@ static void show_time(led_render* render)
     time_t now;
     struct tm* tm_now;
 
+    return;
+
     time(&now);
     tm_now = localtime(&now);
 
@@ -711,55 +858,86 @@ static void show_time(led_render* render)
     flush_sec(render, tm_now->tm_sec);
 }
 
-static void show_wave(led_render* render, int degree)
+static void show_wave(led_render* render, int wave[FIXED_WIDTH])
 {
+    led_device *dev;
     int x, y;
-    int seed;
+    int hit, top;
 
-#ifdef DEBUG
-    // printf("[LS] wave degree %d\n", degree);
-#endif
+    dev = get_device("hbs1632.2");
+    if (!dev) {
+        return;
+    }
 
-    srand(time(NULL));
+    lr_clear(render);
+    // draw base
+    for (x = 0; x < render->width; x++) {
+        hit = CLIP(wave[x], 0, render->width-1);
+        if (hit > dev->wave[x]) {
+            dev->wave[x] = hit;
+            top = hit;
+        }
+        else {
+            dev->wave[x] = MAX(0, dev->wave[x]-1);
+            top = dev->wave[x];
+        }
 
-    if (degree == 90) {
+        // if (x == 1)
+        //     printf("(%d, %d, %d)\n", hit, top, dev->wave[x]);
+
+        hit = render->width - hit;
         for (y = 0; y < render->height; y++) {
-            seed = 1 + rand() % (render->width - 2);
-
-            for (x = 0; x < render->width; x++) {
-                lr_sram(render, x, y, x <= seed);
-            }
+            lr_sram(render, x, y, y >= hit);
         }
-    }
-    else if (degree == 180) {
-        for (x = 0; x < render->width; x++) {
-            seed = 1 + rand() % (render->height - 2);
 
-            for (y = 0; y < render->height; y++) {
-                lr_sram(render, x, y, y <= seed);
-            }
-        }
-    }
-    else if (degree == 270) {
-        for (y = 0; y < render->height; y++) {
-            seed = 1 + rand() % (render->width - 2);
-
-            for (x = 0; x < render->width; x++) {
-                lr_sram(render, x, y, x > seed);
-            }
-        }
-    }
-    else {
-        for (x = 0; x < render->width; x++) {
-            seed = 1 + rand() % (render->height - 2);
-
-            for (y = 0; y < render->height; y++) {
-                lr_sram(render, x, y, y > seed);
-            }
-        }
+        // if (top > 0) {
+        //     top = render->width - top;
+        //     lr_sram(render, x, top, 1);
+        // }
     }
 
     lr_flush(render);
+
+    // printf("\n");
+}
+
+static void show_random_wave(led_render* render)
+{
+    int wave[FIXED_WIDTH];
+    int i;
+
+    for (i = 0; i < FIXED_WIDTH; i++)
+        wave[i] = 1 + rand() % (FIXED_WIDTH - 2);
+
+    show_wave(render, wave);
+}
+
+static void show_spectrum_wave(led_render* render)
+{
+    int wave[FIXED_WIDTH];
+    wave_spectrum_t *ws;
+    // int i;
+
+    ws = &wave_spectrum;
+    // for (i = 0; i < FIXED_WIDTH; i++)
+    wave[0] = (int)ws->amps[1];    // 86Hz
+    wave[1] = (int)ws->amps[2];    // 172Hz
+    wave[2] = (int)ws->amps[3];    // 258Hz
+    wave[3] = (int)ws->amps[5];    // 430Hz
+    wave[4] = (int)ws->amps[7];    // 603Hz
+    wave[5] = (int)ws->amps[9];    // 775Hz
+    wave[6] = (int)ws->amps[13];   // 1.1KHz
+    wave[7] = (int)ws->amps[19];   // 1.6KHz
+    wave[8] = (int)ws->amps[23];   // 1.9KHz
+    wave[9] = (int)ws->amps[26];   // 2.2KHz
+    wave[10] = (int)ws->amps[56];  // 4.8KHz
+    wave[11] = (int)ws->amps[90];  // 7.7KHz
+    wave[12] = (int)ws->amps[128]; // 11KHz
+    wave[13] = (int)ws->amps[163]; // 14KHz
+    wave[14] = (int)ws->amps[198]; // 17KHz
+    wave[15] = (int)ws->amps[232]; // 20KHz
+
+    show_wave(render, wave);
 }
 
 static void show_love(led_render* render)
@@ -784,13 +962,14 @@ static void show_love(led_render* render)
     int x, y;
     int width, height;
 
+    return;
+
 #ifdef DEBUG
     // printf("[LS] loving\n");
 #endif
 
     lr_clear(render);
 
-#define MIN(x, y) (x) > (y) ? (y) : (x)
     width = MIN(render->width, LOVE_WIDTH);
     height = MIN(render->height, LOVE_HEIGHT);
 

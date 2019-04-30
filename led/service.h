@@ -11,9 +11,9 @@ Usage:
 
 	uni_hal_led_register("hbs1632");
 	uni_hal_led_ctrl("hbs1632", "Fully On");
-	
+
 	... // put any LED ctrl here
-	
+
 	uni_hal_led_unregister("hbs1632");
 */
 
@@ -30,6 +30,8 @@ void uni_hal_led_unregister(const char *name);
 	'Engine Setup' (Setup/Shutdown/Start/Stop)
 */
 int uni_hal_led_ctrl(const char *name, const char *cmd);
+
+int uni_hal_led_feed_buffer(const char *buf, int size);
 
 #ifdef __cplusplus
 }

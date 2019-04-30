@@ -1,9 +1,9 @@
-#CROSS_COMPILE := arm-none-linux-gnueabi-
+CROSS_COMPILE := arm-none-linux-gnueabi-
 CC = $(CROSS_COMPILE)gcc
 STRIP = $(CROSS_COMPILE)strip
 CFLAGS = -Wall -g -O -fPIC
 LDFLAGS := -L./
-LIBS    := -lled -lpthread
+LIBS    := -lled -lpthread -lm -lkissfft
 INCLUDES := -I./
 
 LIB_LED = libled.so
